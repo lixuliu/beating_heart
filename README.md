@@ -8,7 +8,7 @@ A beautiful 3D animated heart made with flowing particles - a special birthday g
 
 Watch the beautiful animation in action:
 
-https://github.com/lixuliu/beating_heart/assets/your-user-id/demo.mp4
+![Demo Video](demo.mp4)
 
 ## ✨ Features
 
@@ -54,9 +54,6 @@ This is a heartfelt birthday gift created with love for my niece. The flowing pa
 ## 🎂 Happy Birthday!
 
 May this digital heart remind you of all the love and joy you bring to our family. Every particle represents a wish for your happiness, success, and all the wonderful adventures that lie ahead!
-
-With all my love,
-Your loving uncle/aunt 💖
 
 ---
 
