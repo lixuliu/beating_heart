@@ -8,7 +8,7 @@ A beautiful 3D animated heart made with flowing particles - a special birthday g
 
 Watch the beautiful animation in action:
 
-![Screen Recording](Screen%20Recording.mov)
+https://github.com/lixuliu/beating_heart/assets/your-user-id/demo.mp4
 
 ## ✨ Features
 
