@@ -8,10 +8,7 @@ A beautiful 3D animated heart made with flowing particles - a special birthday g
 
 Watch the beautiful animation in action:
 
-<video width="800" controls>
-  <source src="demo.mp4" type="video/mp4">
-  Your browser does not support the video tag.
-</video>
+![Beating Heart Animation](demo.gif)
 
 **Live Demo**: [https://lixuliu.github.io/beating_heart/](https://lixuliu.github.io/beating_heart/)
 
