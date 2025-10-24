@@ -1,0 +1,700 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Flowing Heart Particles</title>
+    <!-- Copyright (c) 2025 lixuliu - All Rights Reserved -->
+    <!-- This work is protected by copyright law. Unauthorized use is prohibited. -->
+    <style>
+      body {
+        margin: 0;
+        overflow: hidden;
+        background: #000;
+      }
+      canvas {
+        display: block;
+      }
+      .controls {
+        position: fixed;
+        top: 20px;
+        left: 20px;
+        color: #fff;
+        font-family: Arial, sans-serif;
+        font-size: 14px;
+        background: rgba(0, 0, 0, 0.5);
+        padding: 10px;
+        border-radius: 5px;
+      }
+      .controls kbd {
+        background: #333;
+        padding: 2px 6px;
+        border-radius: 3px;
+        margin: 0 2px;
+      }
+      .controls button {
+        background: #222;
+        color: #fff;
+        border: 1px solid #444;
+        padding: 6px 10px;
+        border-radius: 4px;
+        cursor: pointer;
+        margin: 0 6px 0 0;
+        -webkit-tap-highlight-color: transparent;
+      }
+      .controls button:active {
+        transform: scale(0.98);
+      }
+    </style>
+  </head>
+  <body>
+    <div class="controls">
+      <button id="btnPause" type="button">Pause / Resume</button>
+      <button id="btnDensity" type="button">Particle Density</button>
+      <button id="btnColor" type="button">Color Style</button>
+      <button id="btnFlow" type="button">Flow Pause / Resume</button>
+    </div>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script>
+      let scene, camera, renderer;
+      let heartParticles = [];
+      let platformParticles = [];
+      let running = true;
+      let flowPaused = true;
+      let flowAutoPauseTimer = null;
+      let flowTarget = 0; // 0 paused, 1 flowing
+      let flowAmount = 0; // smoothed [0,1] toward flowTarget
+      let flowBlend = 0; // blend approach particles toward target when pausing
+      let flowBlendTarget = 0;
+      let lastFrameTime = null;
+      let flowResumePhase = 0; // 1 right after resume, decays to 0 for smoother start
+
+      // Reflection plane height (push farther from the heart)
+      const REFLECTION_PLANE_Y = -2.5;
+
+      // Additional offset to tweak distance between heart and its reflection
+      // Positive values move the reflection upward (closer), negative move it downward (farther)
+      const REFLECTION_OFFSET_Y = 8;
+
+      // Reflection visual params
+      const REFLECTION_PARAMS = {
+        baseOpacity: 1.5, // stronger color
+        sizePx: 4.0, // point size in pixels for reflection
+        fadeStrength: 0.15, // gentle fade so mirror stays visible
+      };
+
+      function createReflectionMaterial(colorHex) {
+        const uniforms = {
+          uColor: { value: new THREE.Color(colorHex) },
+          uBaseOpacity: { value: REFLECTION_PARAMS.baseOpacity },
+          uPlaneY: { value: REFLECTION_PLANE_Y },
+          uFadeStrength: { value: REFLECTION_PARAMS.fadeStrength },
+          uSizePx: { value: REFLECTION_PARAMS.sizePx },
+        };
+
+        const vertexShader = `
+          uniform float uSizePx;
+          varying float vWorldY;
+          void main() {
+            vec4 worldPos = modelMatrix * vec4(position, 1.0);
+            vWorldY = worldPos.y;
+            vec4 mvPosition = modelViewMatrix * vec4(position, 1.0);
+            gl_Position = projectionMatrix * mvPosition;
+            float dist = length(mvPosition.xyz);
+            gl_PointSize = uSizePx / max(0.0001, dist);
+          }
+        `;
+
+        const fragmentShader = `
+          uniform vec3 uColor;
+          uniform float uBaseOpacity;
+          uniform float uPlaneY;
+          uniform float uFadeStrength;
+          varying float vWorldY;
+          void main() {
+            vec2 uv = gl_PointCoord - vec2(0.5);
+            float r = length(uv);
+            if (r > 0.5) discard; // circular points
+
+            // Only fade with distance BELOW the reflection plane
+            float below = max(0.0, uPlaneY - vWorldY);
+            float fade = exp(-uFadeStrength * below);
+            float alpha = uBaseOpacity * fade;
+            gl_FragColor = vec4(uColor, alpha);
+          }
+        `;
+
+        return new THREE.ShaderMaterial({
+          uniforms,
+          vertexShader,
+          fragmentShader,
+          transparent: true,
+          blending: THREE.AdditiveBlending,
+          depthWrite: false,
+        });
+      }
+
+      // 粒子数量模式
+      const COUNT_MODES = [3000, 5000, 8000];
+      let countModeIndex = 0;
+      let particleCount = COUNT_MODES[countModeIndex];
+
+      // 颜色方案
+      const palettes = [
+        { heart: 0xff1493, platform: 0x87ceeb }, // 深粉+蓝
+        { heart: 0xff4d88, platform: 0x6366f1 }, // 粉红+紫
+        { heart: 0xef4444, platform: 0x10b981 }, // 红+绿
+      ];
+      let styleIndex = 0;
+
+      // Smoke-like flow tuning constants
+      const SMOKE = {
+        curl: 0.12, // reduced curling for a gentler feel
+        noise: 0.04, // much softer jitter
+        riseBias: 0.015, // slightly softer rise
+        lerp: 0.035, // gentler interpolation toward target
+        curlFreq: 0.6, // slower curl
+        noiseFreq: 1.6, // slower noise
+        spiral: 0.18, // subtle romantic spiral radius
+        spiralFreq: 0.35, // slow global spiral frequency
+      };
+
+      // Romantic tuning applied only during approach-phase motion while flowing
+      const FLOW_STYLE = {
+        speedScale: 0.5, // global flow speed multiplier (slower sustained flow)
+        riseScale: 0.8, // softer vertical rise
+        curlScale: 0.55, // less side curl
+        spiralScale: 1.25, // slightly wider spiral arcs
+        noiseScale: 0.5, // gentler jitter
+        freqScale: 0.9, // slightly slower oscillation frequencies
+      };
+
+      // 使用隐式爱心函数判断点是否在爱心内部
+      function heartImplicit2D(x, y) {
+        const a = x * x + y * y - 1;
+        return a * a * a - x * x * y * y * y;
+      }
+
+      function isInside2D(x, y) {
+        return heartImplicit2D(x, y) <= 0;
+      }
+
+      // 参数方程生成爱心曲线点
+      function heartParam(t) {
+        let x = 16 * Math.pow(Math.sin(t), 3);
+        let y =
+          13 * Math.cos(t) -
+          5 * Math.cos(2 * t) -
+          2 * Math.cos(3 * t) -
+          Math.cos(4 * t);
+        return { x: x / 18, y: -y / 18 }; // 归一化并翻转y轴（心尖向下）
+      }
+
+      class Particle {
+        constructor(isHeart) {
+          this.isHeart = isHeart;
+          this.reset();
+        }
+
+        reset() {
+          if (this.isHeart) {
+            // 起点：从平台随机位置开始
+            const angle = Math.random() * Math.PI * 100;
+            const radius = Math.random() * 20;
+            this.x = Math.cos(angle) * radius;
+            this.z = Math.sin(angle) * radius * 0.7;
+            this.y = -12;
+
+            // 目标：使用拒绝采样在爱心区域内找一个点
+            let found = false;
+            let tries = 0;
+            while (!found && tries < 10) {
+              const tx = (Math.random() - 0.5) * 2.7; // x范围 ±1.35
+              const ty = (Math.random() - 0.5) * 2.8; // y范围约 -1.6 到 1.2
+
+              if (isInside2D(tx, ty)) {
+                // 3D化：添加z深度
+                const tz = (Math.random() - 0.5) * 3;
+
+                this.targetX = tx * 5;
+                this.targetY = ty * 5 + 8; // 抬高位置
+                this.targetZ = tz;
+                found = true;
+              }
+              tries++;
+            }
+
+            // 如果拒绝采样失败，使用参数方程生成
+            if (!found) {
+              const t = Math.random() * Math.PI * 2;
+              const p = heartParam(t);
+              const u = Math.pow(Math.random(), 1); // 偏向边缘
+              this.targetX = p.x * u * 8;
+              this.targetY = p.y * u * 8 + 8;
+              this.targetZ = (Math.random() - 0.1) * 9;
+            }
+
+            // Slower base speed for smoke-like flow
+            this.speed = 0.006 + Math.random() * 0.008;
+            this.progress = 0;
+            this.life = Math.random();
+            this.seed = Math.random() * 3000;
+          } else {
+            // 平台粒子 - 静止不动
+            const angle = Math.random() * Math.PI * 10;
+            const radius = Math.random() * 12; // narrower platform for more coherent flow
+            this.x = Math.cos(angle) * radius;
+            this.z = Math.sin(angle) * radius * 0.5;
+            this.y = -12 + Math.random() * 5;
+          }
+        }
+
+        update(time) {
+          if (this.isHeart) {
+            // When flow is effectively paused, always display heartbeat at target
+            if (flowAmount < 0.05) {
+              const bpm = 60;
+              const beatA = 0.08;
+              const beatB = 0.04;
+              const beat =
+                beatA * Math.sin(2 * Math.PI * (bpm / 60) * time) +
+                beatB * Math.sin(4 * Math.PI * (bpm / 60) * time);
+              const scale = 1 + beat;
+
+              const jx = 0.15 * Math.sin(time * 1.7 + this.seed);
+              const jy = 0.15 * Math.cos(time * 1.3 + this.seed * 1.231);
+              const jz = 0.15 * Math.sin(time * 1.5 + this.seed * 0.873);
+
+              this.x = this.targetX * scale + jx;
+              this.y = this.targetY * scale + jy;
+              this.z = this.targetZ * scale + jz;
+              return;
+            }
+
+            // progress advances scaled by smoothed flowAmount
+            // sustained flow slower and smoother
+            this.progress += this.speed * FLOW_STYLE.speedScale * flowAmount;
+            this.life += 0.01;
+
+            if (this.progress >= 1) {
+              // 到达爱心：双重心跳效果
+              const bpm = 60;
+              const beatA = 0.08;
+              const beatB = 0.04;
+              const beat =
+                beatA * Math.sin(2 * Math.PI * (bpm / 60) * time) +
+                beatB * Math.sin(4 * Math.PI * (bpm / 60) * time);
+              const scale = 1 + beat;
+
+              // 微小抖动
+              const jx = 0.15 * Math.sin(time * 1.7 + this.seed);
+              const jy = 0.15 * Math.cos(time * 1.3 + this.seed * 1.231);
+              const jz = 0.15 * Math.sin(time * 1.5 + this.seed * 0.873);
+
+              this.x = this.targetX * scale + jx;
+              this.y = this.targetY * scale + jy;
+              this.z = this.targetZ * scale + jz;
+
+              // 生命周期结束，重新开始
+              if (this.life > Math.PI * 0.7) {
+                this.reset();
+              }
+            } else {
+              // Approach phase: romantic spiral + soft noise + smoother easing
+              // Smoother ease (cubic in/out)
+              const p = this.progress;
+              const ease =
+                p < 0.5 ? 4 * p * p * p : 1 - Math.pow(-2 * p + 2, 3) / 2;
+              // Scale dynamics with eased flow amount for gentle start
+              // Gentle smoke-like acceleration; even softer immediately after resume
+              const flowBase = Math.max(0, Math.min(1, flowAmount));
+              const resumeSoftener =
+                0.5 + 0.5 * (1 - Math.max(0, Math.min(1, flowResumePhase)));
+              const flowDyn = Math.pow(flowBase, 2.0) * resumeSoftener;
+
+              // Curling side drift (fades as it approaches)
+              const curlPhase =
+                time * (SMOKE.curlFreq * FLOW_STYLE.freqScale) +
+                this.seed * 0.0013;
+              const curlFalloff = Math.pow(1 - this.progress, 1.2); // less side drift near target
+              const dxCurl =
+                Math.cos(curlPhase) *
+                (SMOKE.curl * FLOW_STYLE.curlScale) *
+                curlFalloff *
+                flowDyn;
+              const dzCurl =
+                Math.sin(curlPhase * 1.1) * SMOKE.curl * curlFalloff * flowDyn;
+
+              // Gentle spiral drift
+              const spiralAngle =
+                time * (SMOKE.spiralFreq * FLOW_STYLE.freqScale) +
+                this.progress * 2.4 +
+                this.seed * 0.002;
+              const spiralFalloff = 0.75 * (1 - this.progress); // maintain spiral longer
+              const dxSpiral =
+                Math.cos(spiralAngle) *
+                (SMOKE.spiral * FLOW_STYLE.spiralScale * 1.15) *
+                spiralFalloff *
+                flowDyn;
+              const dzSpiral =
+                Math.sin(spiralAngle) *
+                (SMOKE.spiral * FLOW_STYLE.spiralScale * 1.15) *
+                spiralFalloff *
+                flowDyn;
+
+              // Soft noise jitter
+              const nx =
+                SMOKE.noise *
+                FLOW_STYLE.noiseScale *
+                Math.sin(
+                  time * (SMOKE.noiseFreq * FLOW_STYLE.freqScale) +
+                    this.seed * 0.71
+                ) *
+                flowDyn;
+              const nz =
+                SMOKE.noise *
+                FLOW_STYLE.noiseScale *
+                Math.cos(
+                  time * (SMOKE.noiseFreq * 0.9 * FLOW_STYLE.freqScale) +
+                    this.seed * 0.53
+                ) *
+                flowDyn;
+
+              // Gentle interpolation toward target
+              // Scale approach velocity by flowAmount for smooth slow down
+              // Near the end, slow down a bit more for a romantic settle
+              const endSlow = 0.75 + 0.25 * (1 - Math.min(1, this.progress));
+              const lerpScale = ease * SMOKE.lerp * (flowDyn * 0.9) * endSlow;
+              this.x =
+                this.x +
+                (this.targetX - this.x) * lerpScale +
+                dxCurl +
+                dxSpiral +
+                nx;
+              this.y =
+                this.y +
+                (this.targetY - this.y) * lerpScale +
+                SMOKE.riseBias * FLOW_STYLE.riseScale * flowDyn;
+              this.z =
+                this.z +
+                (this.targetZ - this.z) * lerpScale +
+                dzCurl +
+                dzSpiral +
+                nz;
+
+              // When pausing, softly blend toward exact target to settle shape
+              if (flowBlend > 0.001) {
+                const b = flowBlend * 0.25; // gentle influence
+                this.x = this.x + (this.targetX - this.x) * b;
+                this.y = this.y + (this.targetY - this.y) * b;
+                this.z = this.z + (this.targetZ - this.z) * b;
+              }
+            }
+          }
+          // 平台粒子不更新，保持静止
+        }
+      }
+
+      function init() {
+        scene = new THREE.Scene();
+
+        camera = new THREE.PerspectiveCamera(
+          60,
+          window.innerWidth / window.innerHeight,
+          0.1,
+          1000
+        );
+        camera.position.set(0, 5, 45);
+        camera.lookAt(0, 5, 0);
+
+        renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        document.body.appendChild(renderer.domElement);
+
+        buildParticleSystems();
+
+        // Button controls (click & touch)
+        const bindTap = (el, handler) => {
+          if (!el) return;
+          el.addEventListener("click", handler, false);
+          el.addEventListener(
+            "touchstart",
+            (e) => {
+              e.preventDefault();
+              handler();
+            },
+            { passive: false }
+          );
+        };
+
+        bindTap(document.getElementById("btnPause"), () => {
+          running = !running;
+        });
+        bindTap(document.getElementById("btnDensity"), () => {
+          countModeIndex = (countModeIndex + 1) % COUNT_MODES.length;
+          particleCount = COUNT_MODES[countModeIndex];
+          rebuildHeartParticles();
+        });
+        bindTap(document.getElementById("btnColor"), () => {
+          styleIndex = (styleIndex + 1) % palettes.length;
+          updateColors();
+        });
+
+        bindTap(document.getElementById("btnFlow"), () => {
+          if (flowAutoPauseTimer) {
+            clearTimeout(flowAutoPauseTimer);
+            flowAutoPauseTimer = null;
+          }
+          flowPaused = !flowPaused;
+          flowTarget = flowPaused ? 0 : 1;
+          // Light, constant blend upon resume for clarity
+          flowBlendTarget = flowPaused ? 1 : 0.3;
+          if (!flowPaused) {
+            flowResumePhase = 1; // flag a fresh resume to start extra gentle
+          }
+        });
+
+        window.addEventListener("resize", onWindowResize, false);
+
+        // 开场自动播放流动几秒，再暂停
+        startIntroFlow(3500);
+      }
+
+      // 开场动画：短暂开启流动，随后自动恢复为暂停
+      function startIntroFlow(durationMs = 3500) {
+        if (flowAutoPauseTimer) {
+          clearTimeout(flowAutoPauseTimer);
+          flowAutoPauseTimer = null;
+        }
+        flowPaused = false;
+        flowTarget = 1;
+        flowBlendTarget = 0;
+        flowAutoPauseTimer = setTimeout(() => {
+          flowPaused = true;
+          flowTarget = 0;
+          flowBlendTarget = 1;
+          flowAutoPauseTimer = null;
+        }, durationMs);
+      }
+
+      function buildParticleSystems() {
+        // 爱心粒子
+        const heartGeometry = new THREE.BufferGeometry();
+        const heartPositions = new Float32Array(particleCount * 3);
+
+        heartParticles = [];
+        for (let i = 0; i < particleCount; i++) {
+          const particle = new Particle(true);
+          heartParticles.push(particle);
+          heartPositions[i * 3] = particle.x;
+          heartPositions[i * 3 + 1] = particle.y;
+          heartPositions[i * 3 + 2] = particle.z;
+        }
+
+        heartGeometry.setAttribute(
+          "position",
+          new THREE.BufferAttribute(heartPositions, 3)
+        );
+
+        const heartMaterial = new THREE.PointsMaterial({
+          color: palettes[styleIndex].heart,
+          size: 0.13,
+          transparent: true,
+          opacity: 1,
+          blending: THREE.AdditiveBlending,
+          depthWrite: false,
+        });
+
+        const heartPoints = new THREE.Points(heartGeometry, heartMaterial);
+        heartPoints.name = "heart";
+        scene.add(heartPoints);
+
+        // Heart reflection (mirror across REFLECTION_PLANE_Y)
+        const reflectionMaterial = createReflectionMaterial(
+          palettes[styleIndex].heart
+        );
+        const heartReflection = new THREE.Points(
+          heartGeometry,
+          reflectionMaterial
+        );
+        heartReflection.name = "heartReflection";
+        heartReflection.scale.y = -1; // mirror vertically
+        // Mirror across plane then apply adjustable offset for fine control
+        heartReflection.position.y =
+          2 * REFLECTION_PLANE_Y + REFLECTION_OFFSET_Y;
+        scene.add(heartReflection);
+
+        // 平台粒子
+        const platformGeometry = new THREE.BufferGeometry();
+        const platformCount = 400;
+        const platformPositions = new Float32Array(platformCount * 0.5);
+
+        platformParticles = [];
+        for (let i = 0; i < platformCount; i++) {
+          const particle = new Particle(false);
+          platformParticles.push(particle);
+          platformPositions[i * 3] = particle.x;
+          platformPositions[i * 3 + 1] = particle.y;
+          platformPositions[i * 3 + 2] = particle.z;
+        }
+
+        platformGeometry.setAttribute(
+          "position",
+          new THREE.BufferAttribute(platformPositions, 3)
+        );
+
+        const platformMaterial = new THREE.PointsMaterial({
+          color: palettes[styleIndex].heart,
+          size: 0.05,
+          transparent: true,
+          opacity: 0.14,
+          blending: THREE.AdditiveBlending,
+          depthWrite: false,
+        });
+
+        const platformPoints = new THREE.Points(
+          platformGeometry,
+          platformMaterial
+        );
+        platformPoints.name = "platform";
+        scene.add(platformPoints);
+      }
+
+      function rebuildHeartParticles() {
+        const oldHeart = scene.getObjectByName("heart");
+        if (oldHeart) scene.remove(oldHeart);
+
+        const heartGeometry = new THREE.BufferGeometry();
+        const heartPositions = new Float32Array(particleCount * 3);
+
+        heartParticles = [];
+        for (let i = 0; i < particleCount; i++) {
+          const particle = new Particle(true);
+          heartParticles.push(particle);
+          heartPositions[i * 3] = particle.x;
+          heartPositions[i * 3 + 1] = particle.y;
+          heartPositions[i * 3 + 2] = particle.z;
+        }
+
+        heartGeometry.setAttribute(
+          "position",
+          new THREE.BufferAttribute(heartPositions, 3)
+        );
+
+        const heartMaterial = new THREE.PointsMaterial({
+          color: palettes[styleIndex].heart,
+          size: 0.1,
+          transparent: true,
+          opacity: 1,
+          blending: THREE.AdditiveBlending,
+          depthWrite: false,
+        });
+
+        const heartPoints = new THREE.Points(heartGeometry, heartMaterial);
+        heartPoints.name = "heart";
+        scene.add(heartPoints);
+
+        // Remove any existing reflection before recreating
+        const oldReflection = scene.getObjectByName("heartReflection");
+        if (oldReflection) scene.remove(oldReflection);
+
+        // Recreate reflection for rebuilt geometry
+        const reflectionMaterial = createReflectionMaterial(
+          palettes[styleIndex].heart
+        );
+        const heartReflection = new THREE.Points(
+          heartGeometry,
+          reflectionMaterial
+        );
+        heartReflection.name = "heartReflection";
+        heartReflection.scale.y = -1;
+        // Use the same mirror placement plus adjustable offset so distance remains constant across rebuilds
+        heartReflection.position.y =
+          2 * REFLECTION_PLANE_Y + REFLECTION_OFFSET_Y;
+        scene.add(heartReflection);
+      }
+
+      function updateColors() {
+        const heart = scene.getObjectByName("heart");
+        const platform = scene.getObjectByName("platform");
+        const heartReflection = scene.getObjectByName("heartReflection");
+        if (heart) heart.material.color.setHex(palettes[styleIndex].heart);
+        if (platform)
+          platform.material.color.setHex(palettes[styleIndex].heart);
+        if (
+          heartReflection &&
+          heartReflection.material &&
+          heartReflection.material.uniforms
+        ) {
+          heartReflection.material.uniforms.uColor.value.setHex(
+            palettes[styleIndex].heart
+          );
+        }
+      }
+
+      function onWindowResize() {
+        camera.aspect = window.innerWidth / window.innerHeight;
+        camera.updateProjectionMatrix();
+        renderer.setSize(window.innerWidth, window.innerHeight);
+      }
+
+      function animate() {
+        requestAnimationFrame(animate);
+
+        if (!running) {
+          renderer.render(scene, camera);
+          return;
+        }
+
+        const now = Date.now() * 0.001;
+        const time = now;
+        if (lastFrameTime == null) lastFrameTime = now;
+        const dt = Math.min(0.05, Math.max(0.0, now - lastFrameTime));
+        lastFrameTime = now;
+
+        // Smoothly approach flow target
+        let flowEaseIn = 4.0; // softer turn-on
+        const flowEaseOut = 2.8; // speed when turning off (slower for silkiness)
+        // If just resumed, further slow the ramp then fade the effect
+        if (flowResumePhase > 0.001) {
+          flowEaseIn *= 0.5 + 0.5 * (1 - flowResumePhase); // start half speed then ramp up
+          flowResumePhase = Math.max(0, flowResumePhase - dt * 0.25); // ~4s fade
+        }
+        const k = flowTarget > flowAmount ? flowEaseIn : flowEaseOut;
+        flowAmount += (flowTarget - flowAmount) * Math.min(1, k * dt);
+
+        // Smooth blend to target position when pausing
+        const blendSpeed = 3.2;
+        flowBlend +=
+          (flowBlendTarget - flowBlend) * Math.min(1, blendSpeed * dt);
+
+        // 更新爱心粒子
+        const heartObj = scene.getObjectByName("heart");
+        if (heartObj) {
+          const heartPositions = heartObj.geometry.attributes.position.array;
+          for (let i = 0; i < heartParticles.length; i++) {
+            heartParticles[i].update(time);
+            heartPositions[i * 3] = heartParticles[i].x;
+            heartPositions[i * 3 + 1] = heartParticles[i].y;
+            heartPositions[i * 3 + 2] = heartParticles[i].z;
+          }
+          heartObj.geometry.attributes.position.needsUpdate = true;
+
+          // 只旋转爱心，平台保持静止
+          heartObj.rotation.y = Math.sin(time * 2) * 0.4;
+
+          // 同步倒影旋转
+          const heartReflection = scene.getObjectByName("heartReflection");
+          if (heartReflection) {
+            heartReflection.rotation.y = heartObj.rotation.y;
+          }
+        }
+
+        renderer.render(scene, camera);
+      }
+
+      init();
+      animate();
+    </script>
+  </body>
+</html>
